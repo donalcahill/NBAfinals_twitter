@@ -1,0 +1,259 @@
+---
+title: "NBA tweet emoji exploration"
+author: "Donal Cahill"
+date: "June 21, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+Tweets are limited to 140 characters, are chockful of idiosyncratic abbreviations, and are very dependent on context. As such, those who want to measure sentiment through twitter face a tough challenge. Instead of looking at the text of a tweet, an alternative is to look at emojis which, in certain cases, have no meaning other than the sentiment they are associated with (e.g. a smiling face). While not all tweets that express a sentiment will contain an emoji, for those that do, you can be highly confident in identifying the sentiment it expresses. Here we look to see whether emojis alone can tell a coherent story about what is presumably an emotional event for many: the NBA finals.
+
+
+```{r include = FALSE}
+rm(list = ls())
+
+library(twitteR)
+library(plyr)
+library(ggplot2)
+library(cowplot)
+```
+
+### Harvesting Tweets
+I harvested tweets using the "twitteR" package in R. When harvesting tweets you cannot know in advance how many tweets conform to your search parameters. This creates certain difficulties. If you set a low upper bound on tweets to fetch, you risk not fetching all the tweets available, and since tweets are fetched from newest to oldest, not fetching all the tweets will leave gaps in time coverage. However, setting a very large upper bound on tweets to fetch meant quickly running into memory issues. To solve this I wrote the function below which fetched and saved tweets in reasonable sized batches which I could then reload and stitch together later.
+
+Tweets were selected for their hashtags. I used hashtags related to each team in the finals, the Cavaliers and the Warriors. There may be better hashtags; I am not an expert!
+
+
+```{r eval=F}
+consumer_key <- "XXXXX"
+consumer_secret <- "XXXXX"
+access_token <- "XXXXX"
+access_secret <- "XXXXX"
+
+setup_twitter_oauth(consumer_key, consumer_secret, access_token, access_secret)
+
+tags <- list("cavs"="#Cavs OR #CavsNation OR #DefendTheLand OR #clevelandcavaliers",
+             "wrrs"="#Warriors OR #GoldenStateWarriors OR #DubNation OR #GSW")
+
+harvestTweets <- function(tags,fName,batchSize,startDate,endDate) {
+  
+  batchNum <- 1
+  keepCollecting <- TRUE
+  while (keepCollecting) {
+    
+    if (batchNum==1) {
+      tweetBatch <- searchTwitter(tags,n=batchSize,lang="en",since=startDate,until=endDate)
+    } else {
+      tweetBatch <- searchTwitter(tags,n=batchSize,lang="en",since=startDate,maxID=earliestTweetID)
+    }
+    
+    sName <- paste0(fName,"_b",batchNum,".rds")
+    numTweetsInBatch <- length(tweetBatch)
+    tempDF <- twListToDF(tweetBatch[numTweetsInBatch])
+    earliestTweetID <- tempDF$id
+    saveRDS(twListToDF(tweetBatch),sName)
+    if (numTweetsInBatch < batchSize) {keepCollecting <- FALSE} else {batchNum <- batchNum+1}
+    print(tempDF$created)
+    
+  }
+  
+}
+```
+
+### Data cleaning
+First we load the data (~1.9 million tweets)
+
+```{r}
+data <- readRDS("NBAfinals_data.rds")
+```
+
+There is a danger that the data might contain two sorts of duplicates. The first kind are those that are due to some sort of error when fetching the tweets which resulted in fetching a tweet more than once. The second kind are tweets that contain hashtags for both teams. These would have been fetched once when searching for Cavaliers tweets, and then again when looking for Warriors tweets. We will want to keep a single copy of these and make sure they are not labeled for one team specifically.
+
+```{r}
+# clean duplicates
+data <- data[!duplicated(data),] # remove harvesting duplicates
+data[duplicated(data[,names(data)!="team"])|duplicated(data[,names(data)!="team"],fromLast = TRUE),"team"] <- "both" #identify tweets with tags for both teams
+data <- data[!duplicated(data),] # since tweets with both tags are now assigned the same team name (i.e. "both"), they are duplicated. Here we remove the duplicates.
+```
+
+I want to look at sentiment before, during, and after each game. To do that I need to
+anchor the time of each tweet relative to the closest game.
+
+```{r}
+# convert timezones to EST
+attr(data$created, "tzone") <- "America/New_York"
+
+game_start_times <- as.POSIXct(c("2017-06-01 21:00:00",
+                                 "2017-06-04 20:00:00",
+                                 "2017-06-07 21:00:00",
+                                 "2017-06-09 21:00:00",
+                                 "2017-06-12 21:00:00"),
+                               tz="America/New_York")
+# find nearest game
+data$closestGame <- sapply(data$created,function(x) which.min(abs(x-game_start_times)))
+# calculate time to/from the start of the nearest game
+data$timeToGame <- as.numeric(data$created - game_start_times[data$closestGame])
+
+```
+
+### Finding and classifying emojis.
+We can find the unicode strings that correspond to each emoji at http://www.unicode.org/Public/emoji/5.0/emoji-test.txt. Helpfully, this also classifies them into subgroups, including sub-groups for positive and negative expressions. We will take this classification as sufficient for now, though there is likely a lot of room for improvement.
+
+Unfortunately R doesn't return emojis as unicode (see http://opiateforthemass.es/articles/emoticons-in-R/). To identify emojis we first have to re-encode the text strings, which will give us something manageable, though not corresponding to the unicode strings. So we need to translate from the codes that R gives us to the Unicode strings we have. Thankfully someone has already done the Herculean task of tweeting each emoji herself, then downloading her own tweets and matching the resulting code to the emoji in what one might call an R emoji translation dictionary (included here as 'emojis.csv').
+
+```{r}
+# reencode tweet text using iconv
+data$text <- iconv(data$text,"latin1","ascii","byte")
+
+emojiByCat <- readLines("emojiByCat.txt") # text file containing emoji unicode strings and classification
+emojiRDict <- read.csv2("emojis.csv",stringsAsFactors = FALSE) # loading emoji dictionary
+
+# function to scrape unicodes from text file
+getCodes <- function(emojiTextFile,inds) {
+  return(
+    aaply(emojiTextFile[inds],1,function(x) {
+      x <- strsplit(x,"\\s+")[[1]]
+      x <- iconv(x, 'UTF-8', 'latin1', 'byte')
+      x <- x[grep("^<",x)]
+    }
+    )
+  )
+}
+
+# function to translate unicodes into search strings for searching through tweets.
+createEmojiSearchStr <- function(codes) {
+  dictInds <- grep(paste(codes,collapse="|"),emojiRDict$utf8)
+  searchStr <- paste(emojiRDict$ftu8[dictInds],collapse="|")
+  return(searchStr)
+}
+
+posInds <- (which(emojiByCat %in% "# subgroup: face-positive")+1):(which(emojiByCat %in% "# subgroup: face-neutral")-2)
+negInds <- (which(emojiByCat %in% "# subgroup: face-negative")+1):(which(emojiByCat %in% "# subgroup: face-sick")-2)
+
+posCodes <- getCodes(emojiByCat,posInds)
+negCodes <- getCodes(emojiByCat,negInds)
+
+posSearchStr <- createEmojiSearchStr(posCodes)
+negSearchStr <- createEmojiSearchStr(negCodes)
+
+# assign valence to each tweet
+data$valence <- "neutral"
+data$valence[grep(posSearchStr,data$text)] <- "pos"
+data$valence[grep(negSearchStr,data$text)] <- "neg"
+```
+
+### Visualization Functions
+Since the data set is large, and it is not clear what metric and resolution will be the most approriate, it was necessary to create some ad hoc functions to allow me to flexibly explore particular segments of the data. The functions below allow us to specify a time window, and a subset of games and teams to explore, and then summarise the tweets within.
+
+```{r}
+# for convenience
+mins <- 60
+hours <- 60*mins
+days <- 24*hours
+gameLength <- 2.5*hours
+teamCols <- c("orangered3","blue")
+
+game_end_times <- as.POSIXct(c("2017-06-01 23:31:00",
+                               "2017-06-04 22:40:00",
+                               "2017-06-07 23:48:00",
+                               "2017-06-10 00:04:00",
+                               "2017-06-12 23:46:00"),
+                             tz="America/New_York")
+game_end_times_relative <- data.frame(closestGame=1:5,
+                                      endTime=difftime(game_end_times,game_start_times,units="mins"))
+
+# function to select a subset of tweets
+selectTweetsRel <- function(data,timeStart,timeEnd,team=c("cavs","wrrs"),valence = c("pos","neg"),gamesToInclude=1:5) {
+  return(data[data$timeToGame>timeStart &
+                data$timeToGame<timeEnd &
+                data$team %in% team &
+                data$valence %in% valence &
+                data$closestGame %in% gamesToInclude,])
+}
+
+
+# function to summarise
+sumTweets <- function(data,splitVars,timeStart=-hours,timeEnd=hours+gameLength,team=c("cavs","wrrs"),valence = c("pos","neg"),gamesToInclude=1:5,returnValDiff=FALSE,useRetweet=TRUE,cutBreaks) {
+  
+  if (returnValDiff & missing("cutBreaks")) {stop('specify cutBreaks')}
+  if (returnValDiff & ("valence" %in% splitVars)) {stop('cannot split on valence')}
+  if (!useRetweet) data<-data[!data$isRetweet,]
+  data <- selectTweetsRel(data,timeStart,timeEnd,team,valence,gamesToInclude)
+  if (!missing("cutBreaks")) {
+    bks <- seq(timeStart,timeEnd,cutBreaks)
+    data$timeBins <- cut(data$timeToGame,breaks = bks)
+    data$timeBins <- ((as.numeric(data$timeBins)*cutBreaks + timeStart - cutBreaks/2) /mins)  # convert to minutes
+    splitVars <- c(splitVars,"timeBins")
+  }
+  if (returnValDiff) {
+    summData <- ddply(data,splitVars,summarise,valDiff = sum(valence=="pos")-sum(valence=="neg"))
+  } else {
+    summData <- ddply(data,splitVars,summarise,count=nrow(data))
+  }
+  
+  return(summData)
+
+}
+```
+
+
+## Data exploration
+What follows are preliminary explorations of the data, looking at the period leading up to the games, during the games, and immediately after the games. For all these graphs I look at the difference in positive emoji tweets and negative emoji tweets, using that as our sentiment index. For now, I also elected to filter out retweets. While retweets are arguably as likely to be a valid expression of sentiment as a regular tweet, they do have a lower cost (it is easier to retweet than to create your own tweet). An initial look at the data showed that retweets were sporadic and overwhelming of the regular data.
+
+It is important to know for what follows that the Warriors won the first two games comfortably; they won the third game in the dying minutes having trailed up to that point; they lost the fourth game; and then won the fifth game and the championship relatively comfortably.
+
+### Before the game
+Looking at the period before the game, it was my hope to see if our sentiment index could reasonably be construed as a measure of expectation. Our data is not ideal for this because the Warriors were always expected to win. Sure enough, there is no clear signal here. Perhaps some hope can be garnered from the Cavs data, where the two games following the heavy losses in Games 1 and 2 have the lowest anticipatory positive sentiment as the game approaches, and the two games following the stronger showings in Games 3 and 4 show a slightly higher positive sentiment.
+
+```{r}
+# before game
+beforeGame <- sumTweets(data,c("team","closestGame"),timeStart=-12*hours,timeEnd=0,returnValDiff = TRUE,useRetweet=FALSE,cutBreaks= hours)
+beforeGame$closestGame <- as.factor(beforeGame$closestGame)
+ggplot(beforeGame,aes(x=timeBins,y=valDiff,group=closestGame,color=closestGame)) + geom_line(size=1) +
+  facet_grid(team~.) +
+  labs(x="Minutes relative to game start",y="Pos.-Neg. Tweets",color="Game") +
+  theme(legend.position = "top")
+```
+
+### During the game
+Gratifyingly, during the game it seems that the team that is winning has the higher positive sentiment. In Games 1 and 2 it is the Warriors. In game 4 it is the Cavaliers. Game 3 is interesting because for the first half the Warriors were ahead, only for the Cavaliers to overtake them in the final quarter. This is reflected in the sentiment here. Game 5 sees a huge spike for the Warriors around half time. I missed this game, so I don't know what it could be!
+
+```{r}
+duringGame <- sumTweets(data,c("team","closestGame"),timeStart=0,timeEnd=gameLength,returnValDiff = TRUE,useRetweet=FALSE,cutBreaks= 10*mins)
+ggplot(duringGame ,aes(x=timeBins,y=valDiff,group=team,color=team)) + geom_line(size=1) +
+  facet_grid(closestGame~.) +
+  labs(x="Minutes relative to game start",y="Pos.-Neg. Tweets") +
+  scale_color_manual(values=teamCols,
+                     labels=c("Cavaliers","Warriors"),
+                     name="") +
+  theme(legend.position = "top",
+        strip.text = element_blank(),
+        strip.background = element_blank())
+```
+
+### After the game
+Again, the sentiment index seems coherent here, with rises in positive sentiment at the end of the game for the team that won the game. Perhaps the most interesting is the spike at the end of game 3. In contrast to the pedestrian strolls to the finish for the Warriors in games 1 and 2, game 3 was only won in the dying moments. The magnitude of the reaction to game 3 could indicate surprise or relief. It would be fun to verify this over a season's worth of games with recorded moment by moment scores.
+
+```{r}
+afterGame <- sumTweets(data,c("team","closestGame"),timeStart=gameLength-15*mins,timeEnd=gameLength+hours,returnValDiff = TRUE,useRetweet=FALSE,cutBreaks= 5*mins)
+ggplot(afterGame ,aes(x=timeBins,y=valDiff,group=team,color=team)) + geom_line(size=1) +
+  geom_vline(aes(xintercept = endTime),data=game_end_times_relative) +
+  facet_grid(closestGame~.) +
+  labs(x="Minutes relative to game start",y="Pos.-Neg. Tweets") +
+  scale_color_manual(values=teamCols,
+                     labels=c("Cavaliers","Warriors"),
+                     name="") +
+  theme(legend.position = "top",
+        strip.text = element_blank(),
+        strip.background = element_blank())
+
+```
+
+
+
+
+
